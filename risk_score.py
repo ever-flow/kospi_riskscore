@@ -1,17 +1,3 @@
-# -*- coding: utf-8 -*-
-"""
-KOSPI Risk Index Calculation (v8.8-fix) — Dynamic Directions, Purged CV, Leakage-Safe Adaptive Ensemble
-──────────────────────────────────────────────────────────────────────────────────────────────────
-[What's new vs v8.8]
-1) (BUG FIX) Resolved 'ValueError: Data must be 1-dimensional'.
-   - Corrected the data alignment logic in the `main` function to ensure the `kospi`
-     variable remains a pandas Series, not a DataFrame. This was the cause of the crash.
-
-2) Maintained from v8.8:
-   - Dynamic Feature Directionality based on tuning period data.
-   - Stronger Model Regularization in Optuna search space.
-"""
-
 from __future__ import annotations
 import os, math, pickle, warnings, datetime as _dt, logging, random, hashlib
 from pathlib import Path
