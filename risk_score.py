@@ -1,3 +1,4 @@
+
 from __future__ import annotations
 import os, math, pickle, warnings, datetime as _dt, logging, random, hashlib
 from pathlib import Path
@@ -35,7 +36,7 @@ OPTUNA_TRIALS = int(os.getenv("N_OPTUNA_TRIALS", 30))
 CV_FOLDS = 6
 MIN_DATA_FOR_TRAIN = 252 * 5
 MODEL_TYPES = ["lasso", "ridge", "elastic", "huber"]
-ALPHA_MIN, ALPHA_MAX= 0.1, 50.0 # [MODIFIED v8.8] 규제 강화
+ALPHA_MIN, ALPHA_MAX= 0.1, 50.0 # 규제 강화
 STEP_CAND = [5]
 ROLL_WIN_CAND = [252, 504]
 CORR_WIN_CAND = [126, 252, 504]
@@ -49,7 +50,7 @@ SMOOTH_LAMBDA_CAND = [0.7, 0.8, 0.85, 0.9]
 
 # 스케일/최종 스케일
 SCALING_METHOD = "percentile" # ("percentile", "z", "none")
-FINAL_RISK_SCALER = "minmax" # ("minmax","percentile","none")
+FINAL_RISK_SCALER = "minmax"  # ("minmax","percentile","none")
 
 # 적응형 앙상블(누수 없는 방식) — 기본 활성화
 ADAPTIVE_ENSEMBLE = True
@@ -136,6 +137,15 @@ def rank_quantile_labels(series: pd.Series, q:int=5)->pd.Series:
 
 def winsorize_series(s: pd.Series, p:float=0.01)->pd.Series:
     lo, hi = s.quantile(p), s.quantile(1-p)
+    return s.clip(lower=lo, upper=hi)
+
+# [FIX-A] 미래정보 누수 방지용 롤링+시프트 winsorize
+def rolling_winsorize_shift(s: pd.Series, window:int=252, p:float=0.01) -> pd.Series:
+    """
+    현재 시점 이전 데이터(shift(1))의 롤링 분위수로 컷오프 산정 → look-ahead 방지.
+    """
+    lo = s.shift(1).rolling(window, min_periods=max(20, window//2)).quantile(p)
+    hi = s.shift(1).rolling(window, min_periods=max(20, window//2)).quantile(1-p)
     return s.clip(lower=lo, upper=hi)
 
 def block_bootstrap_ic(risk: pd.Series, y: pd.Series, horizon:int, block:int=20, n:int=1000, seed:int=SEED)\
@@ -230,7 +240,9 @@ def _build_flow_norm_from_raw(df_raw: pd.DataFrame)->pd.DataFrame:
     out["I_FlowR"] = df["Institution_20D"] / (base + eps)
     out["D_FlowR"] = df["Individual_20D"] / (base + eps)
 
-    out = out.apply(lambda s: winsorize_series(s, 0.01)).clip(0, 1)
+    # [FIX-A] 전구간 winsorize → 롤링+시프트 winsorize로 교체 (look-ahead 방지)
+    out = out.apply(lambda s: rolling_winsorize_shift(s, window=252, p=0.01)).clip(0, 1)
+
     return out.replace([np.inf, -np.inf], np.nan).ffill()
 
 def get_flow_norm()->pd.DataFrame:
@@ -243,25 +255,26 @@ def get_flow_norm()->pd.DataFrame:
         return _build_flow_norm_from_raw(d)
     return _get_cached("flow_norm", _dl).loc[:END_PD]
 
-# ─────────────────── 3. 특징 계산 (+ 캐시) ─────────────────── #
+# ─────────────────── 3. 특징 계산 ─────────────────── #
 _FEATURES_CACHE: Dict[str, pd.DataFrame] = {}
 
-def _features_cache_key(kospi_idx: pd.Index, roll_window:int)->str:
+def _features_cache_key(kospi_idx: pd.Index, roll_window:int, flips:List[str])->str:
     h = hashlib.md5((",".join(str(x) for x in kospi_idx[:10]) + "|" + str(len(kospi_idx))).encode()).hexdigest()
-    return f"{h}|roll={roll_window}|scale={SCALING_METHOD}"
+    flip_key = ",".join(sorted(flips)) if flips else "-"
+    return f"{h}|roll={roll_window}|scale={SCALING_METHOD}|flip={flip_key}"
 
 def get_dynamic_directions(features_df: pd.DataFrame, y: pd.Series, horizon: int) -> List[str]:
     """
-    [NEW v8.8]
-    Calculate the correlation of each feature with future returns over a given period.
-    Returns a list of features that have a POSITIVE correlation, indicating they
-    should be inverted to be treated as risk factors.
+    동적 방향성: 미래 수익률(H)과 양(+) 상관이면 '리스크'로 보기 위해 뒤집는다.
+    [FIX-B 유지] RegimeBull은 flip 대상에서 제외한다.
     """
     target = y.pct_change(horizon).shift(-horizon)
     positive_corr_features = []
     logger.info(f"Calculating dynamic directions over {y.index.min().year}-{y.index.max().year} for H={horizon}...")
     for col in features_df.columns:
-        ic, p_val = safe_spearman(features_df[col], target)
+        if col == "RegimeBull":  # exclude
+            continue
+        ic, _ = safe_spearman(features_df[col], target)
         if isinstance(ic, float) and not np.isnan(ic) and ic > 0:
             positive_corr_features.append(col)
             logger.info(f"  ▸ Feature '{col}' has positive correlation ({ic:.3f}). Will be inverted.")
@@ -271,34 +284,31 @@ def _calculate_features(
     kospi: pd.Series, prices: pd.DataFrame, yields: pd.DataFrame, per_pbr: pd.DataFrame,
     flows_norm: pd.DataFrame, roll_window: int, features_to_flip: List[str]
 )->pd.DataFrame:
-    """
-    [MODIFIED v8.8]
-    - Accepts `features_to_flip`, a list of feature names.
-    - This list is determined by `get_dynamic_directions` based on tuning data.
-    - It inverts the scale for these specific features to align them as risk factors.
-    """
     idx = kospi.index
     for x in (prices, yields, per_pbr, flows_norm):
         idx = idx.intersection(x.index)
     kospi, prices, yields, per_pbr, flows = [x.reindex(idx).ffill() for x in (kospi, prices, yields, per_pbr, flows_norm)]
 
-    key = _features_cache_key(kospi.index, roll_window)
-    if key in _FEATURES_CACHE and key+"|"+",".join(features_to_flip) in _FEATURES_CACHE:
-         return _FEATURES_CACHE[key+"|"+",".join(features_to_flip)].copy()
+    key = _features_cache_key(kospi.index, roll_window, features_to_flip)
+    if key in _FEATURES_CACHE:
+        return _FEATURES_CACHE[key].copy()
 
     yld_spr = (yields["US10Y"] - yields["US2Y"]).rename("YldSpr")
 
     df = pd.DataFrame({
-        "Mom20":      kospi.pct_change(20), "MA50_Rel":   kospi / kospi.rolling(50, min_periods=50).mean() - 1.0,
+        "Mom20":      kospi.pct_change(20),
+        "MA50_Rel":   kospi / kospi.rolling(50, min_periods=50).mean() - 1.0,
         "Vol20":      kospi.pct_change().rolling(20, min_periods=20).std() * np.sqrt(252),
         "VolRatio":   (kospi.pct_change().rolling(20, min_periods=20).std() * np.sqrt(252)) /
                       (prices["SP500"].pct_change().rolling(20, min_periods=20).std() * np.sqrt(252)).replace(0, np.nan),
-        "Ret20":      kospi.pct_change(20), "RetDiff":    kospi.pct_change(20) - prices["SP500"].pct_change(20),
-        "KRW_Change": prices["USDKRW"].pct_change(20), "YldSpr":     yld_spr,
+        "Ret20":      kospi.pct_change(20),
+        "RetDiff":    kospi.pct_change(20) - prices["SP500"].pct_change(20),
+        "KRW_Change": prices["USDKRW"].pct_change(20),
+        "YldSpr":     yld_spr,
         "Cu_Gd":      (prices["COPPER"] / prices["GOLD"]).replace([np.inf, -np.inf], np.nan),
-        "PER":        per_pbr["PER"], "PBR":        per_pbr["PBR"], "VIX":        prices["VIX"],
-        "F_FlowR":    flows["F_FlowR"], "I_FlowR":    flows["I_FlowR"], "D_FlowR":    flows["D_FlowR"] ,
-        "Oil_Ret":    prices["CRUDE_OIL"].pct_change(20), "IEF_Ret":    prices["IEF"].pct_change(20),
+        "PER":        per_pbr["PER"], "PBR": per_pbr["PBR"], "VIX": prices["VIX"],
+        "F_FlowR":    flows["F_FlowR"], "I_FlowR": flows["I_FlowR"], "D_FlowR": flows["D_FlowR"],
+        "Oil_Ret":    prices["CRUDE_OIL"].pct_change(20), "IEF_Ret": prices["IEF"].pct_change(20),
         "IEF_Vol":    prices["IEF"].pct_change().rolling(20, min_periods=20).std() * np.sqrt(252),
     }).ffill()
 
@@ -311,20 +321,27 @@ def _calculate_features(
     else: # "none"
         scaled = df.copy()
 
-    # Step 2: Apply dynamic direction flip
+    # RegimeBull 스케일 정합(0/100) 후 피처에 추가
+    sma200 = kospi.rolling(200, min_periods=200).mean()
+    regime = (kospi >= sma200).astype(float)
+    if SCALING_METHOD in ("percentile", "z"):
+        regime = (regime * 100.0).rename("RegimeBull")   # 0/100로 정렬
+    else:
+        regime = regime.rename("RegimeBull")
+    scaled = pd.concat([scaled, regime.reindex(scaled.index)], axis=1)
+
+    # Step 2: Apply dynamic direction flip (RegimeBull 제외)
     for col in features_to_flip:
+        if col == "RegimeBull":
+            continue
         if col in scaled.columns:
             if SCALING_METHOD in ("percentile", "z"):
                 scaled[col] = 100 - scaled[col]
-            else: # 'none'
+            else:
                 scaled[col] = -scaled[col]
 
-    sma200 = kospi.rolling(200, min_periods=200).mean()
-    regime = (kospi >= sma200).astype(float).rename("RegimeBull")
-    scaled = pd.concat([scaled, regime.reindex(scaled.index)], axis=1)
-
     scaled = scaled.dropna(how='all')
-    _FEATURES_CACHE[key+"|"+",".join(features_to_flip)] = scaled.copy()
+    _FEATURES_CACHE[key] = scaled.copy()
     return scaled
 
 # ─────────────────── 4. 모델 학습 유틸 ─────────────────── #
@@ -361,6 +378,9 @@ def _train_weights_over_time(
     features: pd.DataFrame, target: pd.Series, correlation_window:int, step:int,
     model_type:str, alpha:float, smooth_lambda:float, embargo:int
 )->pd.DataFrame:
+    """
+    반환: 날짜×피처의 가중치(절댓값 합=1로 정규화, ffill)
+    """
     weights = pd.DataFrame(index=features.index, columns=features.columns, dtype=float); prev_w = None
     min_start = correlation_window + embargo
     for i in range(min_start, len(features), step):
@@ -422,6 +442,7 @@ def _objective(trial, kospi, features_tune_data, y_tune, features_to_flip):
     features = _calculate_features(kospi, *features_tune_data, roll_window, features_to_flip)
     score, _ = _purged_cv_score_single_h(features, y_tune, future_days,
                                          correlation_window, step, model_type, alpha, smooth_lambda, CV_FOLDS)
+    # We MINIMIZE IC because more negative IC = better (risk↑ → return↓)
     if score is None or math.isnan(score): return float("inf")
     trial.report(score, 0)
     if trial.should_prune(): raise optuna.TrialPruned()
@@ -464,16 +485,31 @@ def ic_decay_curve(risk: pd.Series, y: pd.Series, horizons: List[int])->pd.DataF
     return res
 
 # ─────────────────── 7. 앙상블(정적/적응형) ─────────────────── #
-def _softmax_abs_ic(ics: Dict[int,float])->Dict[int,float]:
-    arr = np.array([abs(ics.get(h,0.0)) for h in FUTURE_DAYS_ENSEMBLE], dtype=float)
-    if arr.sum()==0 or np.all(~np.isfinite(arr)): w = np.ones_like(arr) / len(arr)
+def _softmax_abs_ic(ics: Dict[int,float], temp: float = 0.5, floor: float = 0.1)->Dict[int,float]:
+    """
+    [High fix] Use fixed temperature + z-score + optional floor to avoid weight collapse to a single H.
+    """
+    x = np.array([abs(ics.get(h,0.0)) for h in FUTURE_DAYS_ENSEMBLE], dtype=float)
+    x = np.nan_to_num(x, nan=0.0, posinf=0.0, neginf=0.0)
+    if (not np.isfinite(x).any()) or np.allclose(x.sum(), 0.0):
+        w = np.ones_like(x) / len(x)
     else:
-        arr = np.nan_to_num(arr, nan=0.0, posinf=0.0, neginf=0.0)
-        w = np.exp(arr / (arr.std() + 1e-6)); w = w / w.sum()
+        x = (x - x.mean()) / (x.std() + 1e-6)       # z-score
+        w = np.exp(x / max(1e-6, temp))
+        w = w / w.sum()
+        if floor and floor > 0:
+            w = np.clip(w, floor, None)
+            w = w / w.sum()
     return {h: float(wi) for h, wi in zip(FUTURE_DAYS_ENSEMBLE, w)}
 
 def build_adaptive_ensemble_safe(risks_by_h: Dict[int, pd.Series], y: pd.Series, lookback:int)\
-        ->Tuple[pd.Series, Dict[int,float], Dict[int,float]]:
+        ->Tuple[pd.Series, Dict[int,float], Dict[int,float], pd.DataFrame, pd.DataFrame]:
+    """
+    반환:
+      - risk_ens: 적응형 앙상블 리스크
+      - w_last, s_last: 마지막 시점의 H별 가중치/부호
+      - w_hist_df, s_hist_df: 전기간의 H별 가중치/부호 (시각화용)
+    """
     base_idx = None
     for r in risks_by_h.values(): base_idx = r.index if base_idx is None else base_idx.intersection(r.index)
     base_idx = base_idx.sort_values()
@@ -483,52 +519,53 @@ def build_adaptive_ensemble_safe(risks_by_h: Dict[int, pd.Series], y: pd.Series,
         t = base_idx[i]; ic_map, sign_map = {}, {}
         for H in FUTURE_DAYS_ENSEMBLE:
             j_end = i - H
-            if j_end <= 5: ic_map[H] = 0.0; sign_map[H] = 1.0; continue
-            j_start = max(0, j_end - lookback); win = base_idx[j_start:j_end]
-            r_win = risks_by_h[H].reindex(win); y_win = target_by_h[H].reindex(win)
-            ic, _ = safe_spearman(r_win, y_win)
-            if ic != ic: ic = 0.0
-            ic_map[H] = float(ic); sign_map[H] = -1.0 if ic > 0 else 1.0
-        w_map = _softmax_abs_ic(ic_map); x = 0.0
+            if j_end <= 5: 
+                ic_map[H] = 0.0; sign_map[H] = 1.0
+            else:
+                j_start = max(0, j_end - lookback); win = base_idx[j_start:j_end]
+                r_win = risks_by_h[H].reindex(win); y_win = target_by_h[H].reindex(win)
+                ic, _ = safe_spearman(r_win, y_win); ic = 0.0 if np.isnan(ic) else float(ic)
+                ic_map[H] = ic; sign_map[H] = -1.0 if ic > 0 else 1.0
+        w_map = _softmax_abs_ic(ic_map, temp=0.5, floor=0.1)   # ← 고정 온도/하한
+        x = 0.0
         for H in FUTURE_DAYS_ENSEMBLE:
             r_t = risks_by_h[H].get(t, np.nan)
-            if np.isnan(r_t): continue
-            x += sign_map[H] * r_t * w_map[H]
+            if not np.isnan(r_t):
+                x += sign_map[H] * r_t * w_map[H]
             w_hist[H].append(w_map[H]); s_hist[H].append(sign_map[H])
         ens_vals.append((t, x))
     risk_ens = pd.Series({t: v for t, v in ens_vals}).dropna()
     w_last = {h: (w_hist[h][-1] if w_hist[h] else np.nan) for h in FUTURE_DAYS_ENSEMBLE}
     s_last = {h: (s_hist[h][-1] if s_hist[h] else np.nan) for h in FUTURE_DAYS_ENSEMBLE}
+    # 타임시리즈 DataFrame 구성
+    w_hist_df = pd.DataFrame({f"H{h}": w_hist[h] for h in FUTURE_DAYS_ENSEMBLE}, index=base_idx)
+    s_hist_df = pd.DataFrame({f"H{h}": s_hist[h] for h in FUTURE_DAYS_ENSEMBLE}, index=base_idx)
     logger.info("Adaptive weights(last): %s", {h: round(w_last[h],4) if w_last[h]==w_last[h] else None for h in FUTURE_DAYS_ENSEMBLE})
     logger.info("Adaptive signs(last):   %s", s_last)
-    return risk_ens, w_last, s_last
+    return risk_ens, w_last, s_last, w_hist_df, s_hist_df
 
 # ─────────────────── 8. 메인 ─────────────────── #
-def main():
-    logger.info("=== KOSPI Risk Index v8.8-fix (features=%s, Dynamic-Directions) ===", SCALING_METHOD)
+def main(topn_features_for_plot:int=8):
+    logger.info("=== KOSPI Risk Index v8.8-fix-A&B (Critical+High fixes applied) ===")
 
     # 데이터 로드
     prices = get_price_data(); yields = get_yields(); per_pbr = get_per_pbr()
     flows = get_flow_norm(); kospi = prices["KOSPI"].dropna()
 
-    # [FIXED v8.8-fix] 공통 인덱스 정렬 (kospi가 Series를 유지하도록 수정)
+    # 공통 인덱스 정렬 (kospi가 Series 유지)
     all_dataframes = [kospi.to_frame('KOSPI'), prices, yields, per_pbr, flows]
     common_index = all_dataframes[0].index
     for df in all_dataframes[1:]:
         common_index = common_index.intersection(df.index)
-    
-    # 데이터 시작일이 제각각일 수 있으므로, 모든 데이터가 존재하는 가장 늦은 시작일 찾기
     common_start = max(_date_range(c)[0] for c in all_dataframes if _date_range(c)[0] is not None)
     common_index = common_index[common_index >= common_start]
-    
     logger.info(f"Common date range: {common_index.min().strftime('%Y-%m-%d')} to {common_index.max().strftime('%Y-%m-%d')}")
 
-    kospi = kospi.reindex(common_index).ffill() # Series 유지
+    kospi = kospi.reindex(common_index).ffill()
     prices = prices.reindex(common_index).ffill()
     yields = yields.reindex(common_index).ffill()
     per_pbr = per_pbr.reindex(common_index).ffill()
     flows = flows.reindex(common_index).ffill()
-
 
     # 튜닝/OOS 구간
     TUNE_END = pd.Timestamp("2018-12-31")
@@ -537,16 +574,14 @@ def main():
     idx_oos1 = kospi.index[(kospi.index>TUNE_END) & (kospi.index<=OOS1_END)]
     idx_oos2 = kospi.index[kospi.index>OOS1_END]
 
-    # [NEW v8.8] 동적 방향성 결정
-    # 튜닝 데이터로 방향성 결정을 위한 임시 피처 생성 (가장 일반적인 roll_window 사용)
+    # 동적 방향성 결정(대표 H=126, RegimeBull 제외)
     temp_features_for_direction = _calculate_features(
         kospi.loc[idx_tune], prices.loc[idx_tune], yields.loc[idx_tune], per_pbr.loc[idx_tune],
-        flows.loc[idx_tune], roll_window=252, features_to_flip=[] # 방향성 미적용
+        flows.loc[idx_tune], roll_window=252, features_to_flip=[]
     )
-    # 대표 호라이즌(126일) 기준으로 방향성 결정
     features_to_flip = get_dynamic_directions(temp_features_for_direction, kospi.loc[idx_tune], horizon=126)
 
-    # Optuna 튜닝
+    # Optuna 튜닝 (IC minimize → 더 음수일수록 좋음)
     logger.info("Tuning up to %s with dynamic directions...", TUNE_END.strftime("%Y-%m-%d"))
     sampler = TPESampler(seed=SEED)
     study = optuna.create_study(direction="minimize", pruner=MedianPruner(n_startup_trials=10, n_warmup_steps=3), sampler=sampler)
@@ -556,60 +591,97 @@ def main():
     best = study.best_params
     logger.info("Optimal params: %s", best)
 
-    # 최적 파라미터로 전체 기간 피처 및 리스크 계산
+    # 최적 파라미터로 전체 피처/리스크 계산
     roll_window, corr_window, step, model_type, alpha, smooth_lambda = \
         best["roll_window"], best["correlation_window"], best["step"], best["model_type"], best["alpha"], best["smooth_lambda"]
     features_all = _calculate_features(kospi, prices, yields, per_pbr, flows, roll_window, features_to_flip)
 
     risks_by_h = {}
+    weights_by_h = {}   # 시각화 저장용
     for H in FUTURE_DAYS_ENSEMBLE:
         target_all = kospi.pct_change(H).shift(-H)
         w_all = _train_weights_over_time(
             features_all, target_all, corr_window, step, model_type, alpha, smooth_lambda, embargo=H
         )
+        weights_by_h[H] = w_all
         risks_by_h[H] = _compute_risk_series(features_all, w_all)
 
-    # 앙상블
+    # [Critical fix] 부호 정렬 단계 제거 → 앙상블에서만 부호 동적 처리
     if not ADAPTIVE_ENSEMBLE:
-        # 정적 앙상블 로직 (v8.6과 동일, 필요 시 사용)
-        pass
+        raise NotImplementedError("Static ensemble path is disabled in this build.")
     else:
-        risks_aligned = {}
-        for H, r in risks_by_h.items():
-            icb,_ = safe_spearman(r.loc[idx_tune], kospi.loc[idx_tune].pct_change(H).shift(-H))
-            risks_aligned[H] = -r if (isinstance(icb,float) and not np.isnan(icb) and icb>0) else r
-        risk_ens, w_map, s_map = build_adaptive_ensemble_safe(risks_aligned, kospi, ADAPTIVE_LOOKBACK)
-        logger.info("Adaptive ensemble(roll IC, embargo-safe) — weights last: %s", {h: round(w_map[h],4) if w_map.get(h) is not None and w_map[h]==w_map[h] else None for h in FUTURE_DAYS_ENSEMBLE})
+        risk_ens, w_last, s_last, w_hist_df, s_hist_df = build_adaptive_ensemble_safe(risks_by_h, kospi, ADAPTIVE_LOOKBACK)
 
-    # 평가
+    # 평가 (원래 OOS 구간)
     for label, idx_eval in [("OOS1(2019-2022)", idx_oos1), ("OOS2(2023-현재)", idx_oos2), ("ALL", features_all.index)]:
         if len(idx_eval)==0: continue
         _ = ic_all_scales(risk_ens.reindex(idx_eval).dropna(), kospi.loc[idx_eval], best["future_days"], label=label)
         _ = quantile_report(risk_ens.reindex(idx_eval).dropna(), kospi.loc[idx_eval], best["future_days"], q=5, label=label)
 
+    # [Equal-length OOS] OOS1 vs OOS2 동일 길이 비교
+    len_oos1, len_oos2 = len(idx_oos1), len(idx_oos2)
+    eq_len = min(len_oos1, len_oos2)
+    if eq_len > 0:
+        idx_oos1_eq = idx_oos1[-eq_len:]
+        idx_oos2_eq = idx_oos2[-eq_len:]
+        for label, idx_eval in [(f"OOS1_EQ(last {eq_len} days)", idx_oos1_eq),
+                                (f"OOS2_EQ(last {eq_len} days)", idx_oos2_eq)]:
+            _ = ic_all_scales(risk_ens.reindex(idx_eval).dropna(), kospi.loc[idx_eval], best["future_days"], label=label)
+            _ = quantile_report(risk_ens.reindex(idx_eval).dropna(), kospi.loc[idx_eval], best["future_days"], q=5, label=label)
+
     ic_decay_df = ic_decay_curve(risk_ens, kospi, horizons=[21,63,126,252])
     mean_ic, (lo, hi) = block_bootstrap_ic(risk_ens, kospi, horizon=best["future_days"], block=BLOCK_SIZE, n=1000, seed=SEED)
     logger.info("[Bootstrap IC @H=%d] mean=%.4f, 95%% CI=(%.4f,%.4f)", best["future_days"], mean_ic, lo, hi)
 
-    # 저장 및 시각화
+    # 저장
     if FINAL_RISK_SCALER == "minmax": risk_scaled = rolling_minmax(risk_ens, 252*5).clip(0, 100)
     elif FINAL_RISK_SCALER == "percentile": risk_scaled = rolling_percentile(risk_ens, 252*5).clip(0, 100)
     else: risk_scaled = risk_ens
 
     risk_scaled.to_csv("kospi_risk_index_v8.csv")
-    pd.Series({f"H{h}_weight": w for h,w in w_map.items()}).to_csv("ensemble_weights_timevarying_last_v8.csv")
+    pd.Series({f"H{h}_weight_last": w for h,w in w_last.items()}).to_csv("ensemble_weights_last_v8.csv")
+    w_hist_df.to_csv("ensemble_weights_timeseries_v8.csv")
+    s_hist_df.to_csv("ensemble_signs_timeseries_v8.csv")
     ic_decay_df.to_csv("ic_decay_v8.csv", index=False)
     pd.DataFrame([{"horizon": best["future_days"], "mean": mean_ic, "ci_low": lo, "ci_high": hi}]).to_csv("bootstrap_ic_v8.csv", index=False)
-    logger.info("CSV saved: kospi_risk_index_v8.csv, ensemble_weights_timevarying_last_v8.csv, diagnostics CSVs.")
+    logger.info("CSV saved: kospi_risk_index_v8.csv, ensemble_weights_last_v8.csv, ensemble_weights_timeseries_v8.csv, diagnostics CSVs.")
 
-    fig = go.Figure() # 시각화 로직은 이전과 동일
+    # ── 시각화 1: 리스크 지수 & KOSPI
+    fig = go.Figure()
     fig.add_trace(go.Scatter(x=risk_scaled.index, y=risk_scaled, name="Risk Index", line=dict(color="red")))
     fig.add_trace(go.Scatter(x=kospi.index, y=kospi, yaxis="y2", name="KOSPI", line=dict(color="blue", dash="dot"), opacity=0.7))
-    fig.update_layout(title=f"KOSPI Risk Index (v8.8-fix, Dynamic Directions)", template="plotly_white", height=700,
+    fig.update_layout(title=f"KOSPI Risk Index (v8.8-fix-A&B, Critical+High fixes)",
+                      template="plotly_white", height=700,
                       yaxis=dict(title="Risk (0-100)", range=[0, 100] if FINAL_RISK_SCALER in ("minmax","percentile") else None),
                       yaxis2=dict(title="KOSPI", overlaying="y", side="right"), legend=dict(x=0.01, y=0.99))
     fig.show()
 
+    # ── 시각화 2: 적응형 앙상블 H별 가중치 타임시리즈
+    fig_w = go.Figure()
+    for H in FUTURE_DAYS_ENSEMBLE:
+        col = f"H{H}"
+        if col in w_hist_df.columns:
+            fig_w.add_trace(go.Scatter(x=w_hist_df.index, y=w_hist_df[col], name=f"{col} weight"))
+    fig_w.update_layout(title="Adaptive Ensemble Weights over Time (H=63/126/252)", template="plotly_white", height=500,
+                        yaxis=dict(title="Weight (softmax on |IC|)"))
+    fig_w.show()
+
+    # ── 시각화 3: 지배적 H의 피처 가중치 Top-N 시리즈(라인)
+    # 마지막 시점에서 가장 큰 가중치를 가진 H 선택
+    dominant_H = max(w_last, key=lambda h: (w_last[h] if w_last[h]==w_last[h] else -1))
+    w_dom = weights_by_h[dominant_H]  # 날짜×피처
+    # 최근 가중치(마지막 유효일)의 절댓값 기준 Top-N 피처 선택
+    last_row = w_dom.dropna(how="all").iloc[-1]
+    top_feats = last_row.abs().sort_values(ascending=False).head(topn_features_for_plot).index.tolist()
+
+    fig_fw = go.Figure()
+    for c in top_feats:
+        fig_fw.add_trace(go.Scatter(x=w_dom.index, y=w_dom[c], name=f"{c} (H{dominant_H})", mode="lines"))
+    fig_fw.update_layout(title=f"Top-{topn_features_for_plot} Feature Weights over Time (Dominant H={dominant_H})",
+                         template="plotly_white", height=600, yaxis=dict(title="Normalized weight (|w| sum = 1)"))
+    fig_fw.show()
+
+    # 현재 리스크 레벨 로그
     if not risk_scaled.empty:
         cur = risk_scaled.iloc[-1]
         label = "N/A"
@@ -617,7 +689,7 @@ def main():
             label = next(lbl for t, lbl in [(80, "Very High"), (60, "High"), (40, "Neutral"), (20, "Low"), (0, "Very Low")] if cur >= t)
         logger.info("[%s] Current Risk: %.2f (%s)", risk_scaled.index[-1].strftime("%Y-%m-%d"), cur, label)
 
-    logger.info("=== Completed v8.8-fix ===")
+    logger.info("=== Completed (Critical+High fixes) ===")
 
 if __name__ == "__main__":
     main()
